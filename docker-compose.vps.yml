@@ -1,0 +1,139 @@
+# Helio on one server (a VPS), next to your 9Router.
+#
+#   docker compose -f docker-compose.vps.yml up -d --build                  # with an SSH tunnel
+#   docker compose -f docker-compose.vps.yml --profile https up -d --build  # with a domain and HTTPS (Caddy)
+#
+# How it is wired:
+#  - Postgres, Redis and Mailpit only listen on 127.0.0.1, so they are never open to the internet.
+#  - The web app and the migration job use the host network. That is why PLATFORM_LLM_BASE_URL can be
+#    http://127.0.0.1:20128/v1: it means the 9Router on this same server.
+#  - The web app listens on 127.0.0.1:3000 only. People reach it through Caddy (HTTPS) or an SSH tunnel.
+# Read VPS.md for the full steps.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: helio
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: helio
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helio -d helio"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Catches emails for testing (read them at http://localhost:8025 through the SSH tunnel).
+  # For real users, set SMTP_HOST and the other SMTP values in .env to a real email service.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8025:8025"
+      - "127.0.0.1:1025:1025"
+
+  migrate:
+    build:
+      context: .
+      target: tools
+    network_mode: host
+    environment:
+      DATABASE_URL: postgresql://helio:${POSTGRES_PASSWORD}@127.0.0.1:5432/helio
+    command:
+      - sh
+      - -c
+      - |
+        if [ -d prisma/migrations ] && [ -n "$(ls -A prisma/migrations)" ]; then
+          npx prisma migrate deploy
+        else
+          echo "No migrations found, using db push (fine for a first test, see VPS.md before real users)."
+          npx prisma db push
+        fi
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      target: runner
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 127.0.0.1
+      PORT: "3000"
+      APP_URL: ${APP_URL:?Set APP_URL in .env}
+      DATABASE_URL: postgresql://helio:${POSTGRES_PASSWORD}@127.0.0.1:5432/helio
+      REDIS_URL: redis://127.0.0.1:6379
+      MASTER_KEY: ${MASTER_KEY:?Set MASTER_KEY in .env (openssl rand -hex 32)}
+      SMTP_HOST: ${SMTP_HOST:-127.0.0.1}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-Helio <no-reply@helio.local>}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      ALLOW_PRIVATE_PROVIDER_URLS: ${ALLOW_PRIVATE_PROVIDER_URLS:-false}
+      TRUST_PROXY: ${TRUST_PROXY:-true}
+      PLATFORM_LLM_BASE_URL: ${PLATFORM_LLM_BASE_URL:-}
+      PLATFORM_LLM_API_KEY: ${PLATFORM_LLM_API_KEY:-}
+      PLATFORM_MODEL_LIGHT: ${PLATFORM_MODEL_LIGHT:-}
+      PLATFORM_MODEL_LIGHT_FALLBACK: ${PLATFORM_MODEL_LIGHT_FALLBACK:-}
+      PLATFORM_MODEL_MEDIUM: ${PLATFORM_MODEL_MEDIUM:-}
+      PLATFORM_MODEL_MEDIUM_FALLBACK: ${PLATFORM_MODEL_MEDIUM_FALLBACK:-}
+      PLATFORM_MODEL_HEAVY: ${PLATFORM_MODEL_HEAVY:-}
+      PLATFORM_MODEL_HEAVY_FALLBACK: ${PLATFORM_MODEL_HEAVY_FALLBACK:-}
+      PLATFORM_DAILY_TOKENS_WORKSPACE: ${PLATFORM_DAILY_TOKENS_WORKSPACE:-1000000}
+      PLATFORM_DAILY_TOKENS_USER: ${PLATFORM_DAILY_TOKENS_USER:-300000}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+
+  # HTTPS in front of the web app. Only starts with:  --profile https
+  # Needs a domain name that points to this server, and ports 80 and 443 open.
+  caddy:
+    profiles: ["https"]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    network_mode: host
+    command: ["caddy", "reverse-proxy", "--from", "${HELIO_DOMAIN:-example.invalid}", "--to", "127.0.0.1:3000"]
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+
+  # --- Phase 3 -----------------------------------------------------------------
+  # worker:           BullMQ worker that runs agent jobs (same image, different command)
+  # sandbox-manager:  starts one locked-down container per workspace for code and file tools
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,10 @@
+node_modules
+.next
+out
+.env
+.env.local
+src/generated
+*.tsbuildinfo
+next-env.d.ts
+coverage
+workspaces-data

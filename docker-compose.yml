@@ -1,0 +1,109 @@
+# Helio, Phase 1 stack: web app, Postgres, Redis, and Mailpit (catches dev emails).
+# The worker and the sandbox manager are added in Phase 3 (see the commented blocks at the bottom).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+        - "5432:5432"
+    environment:
+      POSTGRES_USER: helio
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: helio
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helio -d helio"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "8025:8025" # open http://localhost:8025 to read verification and invite emails
+
+  # Applies the schema once, then exits. Uses migrations if prisma/migrations exists, otherwise `db push`.
+  migrate:
+    build:
+      context: .
+      target: tools
+    environment:
+      DATABASE_URL: postgresql://helio:${POSTGRES_PASSWORD}@postgres:5432/helio
+    command:
+      - sh
+      - -c
+      - |
+        if [ -d prisma/migrations ] && [ -n "$(ls -A prisma/migrations)" ]; then
+          npx prisma migrate deploy
+        else
+          echo "No migrations found, using db push (fine for development)."
+          npx prisma db push
+        fi
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      target: runner
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # lets the container reach a 9Router running on your computer
+    environment:
+      NODE_ENV: production
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      DATABASE_URL: postgresql://helio:${POSTGRES_PASSWORD}@postgres:5432/helio
+      REDIS_URL: redis://redis:6379
+      MASTER_KEY: ${MASTER_KEY:?Set MASTER_KEY in .env (openssl rand -hex 32)}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-Helio <no-reply@helio.local>}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      ALLOW_PRIVATE_PROVIDER_URLS: ${ALLOW_PRIVATE_PROVIDER_URLS:-false}
+      TRUST_PROXY: ${TRUST_PROXY:-true}
+      PLATFORM_LLM_BASE_URL: ${PLATFORM_LLM_BASE_URL:-}
+      PLATFORM_LLM_API_KEY: ${PLATFORM_LLM_API_KEY:-}
+      PLATFORM_MODEL_LIGHT: ${PLATFORM_MODEL_LIGHT:-}
+      PLATFORM_MODEL_LIGHT_FALLBACK: ${PLATFORM_MODEL_LIGHT_FALLBACK:-}
+      PLATFORM_MODEL_MEDIUM: ${PLATFORM_MODEL_MEDIUM:-}
+      PLATFORM_MODEL_MEDIUM_FALLBACK: ${PLATFORM_MODEL_MEDIUM_FALLBACK:-}
+      PLATFORM_MODEL_HEAVY: ${PLATFORM_MODEL_HEAVY:-}
+      PLATFORM_MODEL_HEAVY_FALLBACK: ${PLATFORM_MODEL_HEAVY_FALLBACK:-}
+      PLATFORM_DAILY_TOKENS_WORKSPACE: ${PLATFORM_DAILY_TOKENS_WORKSPACE:-1000000}
+      PLATFORM_DAILY_TOKENS_USER: ${PLATFORM_DAILY_TOKENS_USER:-300000}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+
+  # --- Phase 3 -----------------------------------------------------------------
+  # worker:           BullMQ worker that runs agent jobs (same image, different command)
+  # sandbox-manager:  starts one locked-down container per workspace for code and file tools
+
+volumes:
+  pgdata:

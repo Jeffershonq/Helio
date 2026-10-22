@@ -1,0 +1,564 @@
+// Helio data model.
+// Rule: every workspace-owned row carries workspaceId and every query must filter by it.
+// Use `scoped(workspaceId)` from src/lib/db.ts, which injects that filter for you.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum Tier {
+  LIGHT
+  MEDIUM
+  HEAVY
+}
+
+enum AuthorKind {
+  HUMAN
+  AGENT
+  SYSTEM
+}
+
+enum ThreadKind {
+  TEAM
+  AGENT
+}
+
+enum TaskStatus {
+  BACKLOG
+  IN_PROGRESS
+  NEEDS_YOU
+  IN_REVIEW
+  DONE
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum RequestType {
+  QUESTION
+  CHOICE
+  APPROVAL
+  SECRET
+  UPLOAD
+  DECISION
+}
+
+enum RequestStatus {
+  OPEN
+  ANSWERED
+  EXPIRED
+  CANCELLED
+}
+
+enum RunStatus {
+  QUEUED
+  RUNNING
+  WAITING_HUMAN
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  LIMITED
+}
+
+// Where a workspace's agents get their models from.
+// PLATFORM = the shared provider the operator runs (for example 9Router). OWN = the workspace's own API key.
+enum ProviderMode {
+  PLATFORM
+  OWN
+}
+
+enum EmailTokenKind {
+  VERIFY_EMAIL
+  RESET_PASSWORD
+}
+
+// ---------------------------------------------------------------- Identity
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique // always stored lower-case
+  name            String
+  passwordHash    String? // null for Google-only accounts
+  emailVerifiedAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  sessions          Session[]
+  oauthAccounts     OAuthAccount[]
+  emailTokens       EmailToken[]
+  memberships       Membership[]
+  notifications     Notification[]
+  pushSubscriptions PushSubscription[]
+}
+
+model OAuthAccount {
+  id             String   @id @default(cuid())
+  userId         String
+  provider       String
+  providerUserId String
+  createdAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerUserId])
+  @@index([userId])
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  tokenHash  String   @unique // sha256 of the cookie value; the raw token is never stored
+  expiresAt  DateTime
+  lastSeenAt DateTime @default(now())
+  userAgent  String?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model EmailToken {
+  id        String         @id @default(cuid())
+  userId    String
+  kind      EmailTokenKind
+  tokenHash String         @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime       @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, kind])
+}
+
+// ---------------------------------------------------------------- Workspaces
+
+model Workspace {
+  id                 String    @id @default(cuid())
+  name               String
+  slug               String    @unique
+  description        String?
+  onboardedAt        DateTime?
+  // Deprecated: replaced by providerMode. Kept so existing databases update without data-loss warnings.
+  useDefaultProvider Boolean   @default(false)
+  providerMode       ProviderMode @default(PLATFORM)
+  // With an own key: if it fails, try the shared provider instead of giving up.
+  fallbackToPlatform Boolean   @default(true)
+  // { LIGHT: { model, fallback? }, MEDIUM: {...}, HEAVY: {...} }
+  tierModels         Json      @default("{}")
+  dailyTokenLimitUser      Int?
+  dailyTokenLimitWorkspace Int?
+  maxConcurrentRuns        Int @default(3)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  memberships   Membership[]
+  invites       Invite[]
+  projects      Project[]
+  agents        Agent[]
+  threads       Thread[]
+  messages      Message[]
+  mentions      Mention[]
+  handoffs      Handoff[]
+  tasks         Task[]
+  taskEvents    TaskEvent[]
+  subtasks      Subtask[]
+  requests      Request[]
+  runs          Run[]
+  toolCalls     ToolCall[]
+  files         WorkspaceFile[]
+  providerKeys  ProviderKey[]
+  usageRecords  UsageRecord[]
+  notifications Notification[]
+  auditLogs     AuditLog[]
+}
+
+model Membership {
+  id          String   @id @default(cuid())
+  workspaceId String
+  userId      String
+  role        Role
+  createdAt   DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+}
+
+model Invite {
+  id          String    @id @default(cuid())
+  workspaceId String
+  email       String // lower-case
+  role        Role
+  tokenHash   String    @unique
+  invitedById String
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, email])
+}
+
+model Project {
+  id             String    @id @default(cuid())
+  workspaceId    String
+  name           String
+  description    String?
+  defaultAgentId String? // answers messages that have no @mention (Lyra by default)
+  archivedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  threads   Thread[]
+  tasks     Task[]
+
+  @@index([workspaceId])
+}
+
+model Agent {
+  id          String   @id @default(cuid())
+  workspaceId String
+  key         String // stable slug: lyra, carina, hydra (custom agents can be added later)
+  name        String // display name, the user may rename it
+  role        String
+  color       String
+  tier        Tier
+  soul        String // system prompt
+  allowedTools String[]
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, key])
+}
+
+// ---------------------------------------------------------------- Conversation
+
+model Thread {
+  id          String     @id @default(cuid())
+  workspaceId String
+  projectId   String?
+  kind        ThreadKind
+  agentId     String? // for private agent chats
+  userId      String? // owner of a private agent chat
+  createdAt   DateTime   @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project   Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  messages  Message[]
+
+  // One private chat per person per agent. (Team rooms have null agentId and userId, so they are not limited.)
+  @@unique([workspaceId, kind, agentId, userId])
+  @@index([workspaceId, projectId])
+}
+
+model Message {
+  id          String     @id @default(cuid())
+  workspaceId String
+  threadId    String
+  authorKind  AuthorKind
+  userId      String?
+  agentId     String?
+  body        String
+  replyToId   String?
+  metadata    Json?
+  createdAt   DateTime   @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  thread    Thread    @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  mentions  Mention[]
+  handoff   Handoff?
+
+  @@index([threadId, createdAt])
+  @@index([workspaceId])
+}
+
+model Mention {
+  id          String  @id @default(cuid())
+  workspaceId String
+  messageId   String
+  agentId     String?
+  userId      String?
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  message   Message   @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@index([workspaceId, agentId])
+}
+
+model Handoff {
+  id             String   @id @default(cuid())
+  workspaceId    String
+  messageId      String   @unique
+  fromAgentId    String
+  toAgentId      String
+  status         String
+  artifactPath   String?
+  actionRequired String
+  createdAt      DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  message   Message   @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+}
+
+// ---------------------------------------------------------------- Work board
+
+model Task {
+  id             String     @id @default(cuid())
+  workspaceId    String
+  projectId      String
+  title          String
+  description    String?
+  status         TaskStatus @default(BACKLOG)
+  priority       Priority   @default(MEDIUM)
+  ownerAgentId   String?
+  assigneeUserId String?
+  dueAt          DateTime?
+  labels         String[]
+  position       Float      @default(0)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  workspace Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  events    TaskEvent[]
+  subtasks  Subtask[]
+  requests  Request[]
+
+  @@index([workspaceId, projectId, status])
+}
+
+model TaskEvent {
+  id           String      @id @default(cuid())
+  workspaceId  String
+  taskId       String
+  actorKind    AuthorKind
+  actorUserId  String?
+  actorAgentId String?
+  fromStatus   TaskStatus?
+  toStatus     TaskStatus?
+  note         String?
+  createdAt    DateTime    @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+  @@index([workspaceId, createdAt])
+}
+
+model Subtask {
+  id          String  @id @default(cuid())
+  workspaceId String
+  taskId      String
+  title       String
+  done        Boolean @default(false)
+  position    Int     @default(0)
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+}
+
+// "Needs you": a structured question from an agent to the human.
+model Request {
+  id            String        @id @default(cuid())
+  workspaceId   String
+  taskId        String?
+  agentId       String
+  runId         String?
+  type          RequestType
+  title         String
+  body          String // what the agent needs
+  triedAlready  String? // what it already tried
+  options       Json?
+  dueAt         DateTime?
+  defaultAnswer Json?
+  status        RequestStatus @default(OPEN)
+  answer        Json? // secrets are stored encrypted, never here in clear text
+  answeredById  String?
+  answeredAt    DateTime?
+  createdAt     DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  task      Task?     @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, status])
+}
+
+// ---------------------------------------------------------------- Agent runtime
+
+model Run {
+  id           String    @id @default(cuid())
+  workspaceId  String
+  agentId      String
+  threadId     String?
+  trigger      String // message | mention | schedule | request_answered
+  status       RunStatus @default(QUEUED)
+  state        Json? // saved loop state, used to pause and resume
+  steps        Int       @default(0)
+  inputTokens  Int       @default(0)
+  outputTokens Int       @default(0)
+  costUsd      Decimal   @default(0) @db.Decimal(12, 6)
+  error        String?
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  createdAt    DateTime  @default(now())
+
+  workspace Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  toolCalls ToolCall[]
+
+  @@index([workspaceId, status])
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, threadId])
+}
+
+model ToolCall {
+  id          String   @id @default(cuid())
+  workspaceId String
+  runId       String
+  name        String
+  input       Json
+  output      Json? // already redacted before it is stored
+  ok          Boolean?
+  durationMs  Int?
+  createdAt   DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  run       Run       @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+}
+
+model WorkspaceFile {
+  id            String     @id @default(cuid())
+  workspaceId   String
+  path          String // relative to the workspace root, e.g. specs/invoice-export.md
+  version       Int        @default(1)
+  authorKind    AuthorKind
+  authorUserId  String?
+  authorAgentId String?
+  sizeBytes     Int        @default(0)
+  mimeType      String?
+  sha256        String?
+  createdAt     DateTime   @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, path, version])
+  @@map("File")
+}
+
+// ---------------------------------------------------------------- Models, usage, alerts
+
+model ProviderKey {
+  id           String    @id @default(cuid())
+  workspaceId  String
+  label        String
+  baseUrl      String
+  encryptedKey String // AES-256-GCM, bound to workspaceId via AAD; never returned to clients
+  last4        String
+  createdById  String
+  createdAt    DateTime  @default(now())
+  rotatedAt    DateTime?
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, label])
+}
+
+model UsageRecord {
+  id           String   @id @default(cuid())
+  workspaceId  String
+  userId       String?
+  agentId      String?
+  runId        String?
+  model        String
+  source       String   @default("PLATFORM") // PLATFORM (shared provider) or OWN (the workspace's key)
+  inputTokens  Int
+  outputTokens Int
+  costUsd      Decimal  @default(0) @db.Decimal(12, 6)
+  createdAt    DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, userId, createdAt])
+}
+
+model Notification {
+  id          String    @id @default(cuid())
+  workspaceId String
+  userId      String
+  kind        String
+  title       String
+  body        String?
+  href        String?
+  readAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  workspaceId  String
+  actorUserId  String?
+  actorAgentId String?
+  action       String // e.g. workspace.create, provider.set, invite.create
+  targetType   String?
+  targetId     String?
+  metadata     Json?
+  ip           String?
+  createdAt    DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, createdAt])
+}
