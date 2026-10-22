@@ -39,13 +39,6 @@ export function LoginForm({ next, notice, googleEnabled }: { next: string; notic
       {googleEnabled ? (
         <>
           <Button asChild variant="secondary" block>
-            <a href={`/api/auth/google?next=${encodeURIComponent(next)}`}>Continue with Google</a>
-          </Button>
-          <p className="text-center text-xs text-muted">or use your email</p>
-        </>
-      ) : null}{googleEnabled ? (
-        <>
-          <Button asChild variant="secondary" block>
             <a 
               href={`/api/auth/google?next=${encodeURIComponent(next)}`}
               className="flex items-center justify-center gap-2"
